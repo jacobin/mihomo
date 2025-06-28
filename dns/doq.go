@@ -13,10 +13,11 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/component/ca"
+	tlsC "github.com/metacubex/mihomo/component/tls"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
-	"github.com/metacubex/quic-go"
 
+	"github.com/metacubex/quic-go"
 	D "github.com/miekg/dns"
 )
 
@@ -60,30 +61,31 @@ type dnsOverQUIC struct {
 	bytesPool      *sync.Pool
 	bytesPoolGuard sync.Mutex
 
-	addr         string
-	proxyAdapter C.ProxyAdapter
-	proxyName    string
-	r            *Resolver
+	addr           string
+	dialer         *dnsDialer
+	skipCertVerify bool
 }
 
 // type check
 var _ dnsClient = (*dnsOverQUIC)(nil)
 
 // newDoQ returns the DNS-over-QUIC Upstream.
-func newDoQ(resolver *Resolver, addr string, proxyAdapter C.ProxyAdapter, proxyName string) (dnsClient, error) {
+func newDoQ(addr string, resolver *Resolver, params map[string]string, proxyAdapter C.ProxyAdapter, proxyName string) *dnsOverQUIC {
 	doq := &dnsOverQUIC{
-		addr:         addr,
-		proxyAdapter: proxyAdapter,
-		proxyName:    proxyName,
-		r:            resolver,
+		addr:   addr,
+		dialer: newDNSDialer(resolver, proxyAdapter, proxyName),
 		quicConfig: &quic.Config{
 			KeepAlivePeriod: QUICKeepAlivePeriod,
 			TokenStore:      newQUICTokenStore(),
 		},
 	}
 
+	if params["skip-cert-verify"] == "true" {
+		doq.skipCertVerify = true
+	}
+
 	runtime.SetFinalizer(doq, (*dnsOverQUIC).Close)
-	return doq, nil
+	return doq
 }
 
 // Address implements the Upstream interface for *dnsOverQUIC.
@@ -146,6 +148,10 @@ func (doq *dnsOverQUIC) Close() (err error) {
 	}
 
 	return err
+}
+
+func (doq *dnsOverQUIC) ResetConnection() {
+	doq.closeConnWithError(nil)
 }
 
 // exchangeQUIC attempts to open a QUIC connection, send the DNS message
@@ -300,7 +306,7 @@ func (doq *dnsOverQUIC) openConnection(ctx context.Context) (conn quic.Connectio
 	// we're using bootstrapped address instead of what's passed to the function
 	// it does not create an actual connection, but it helps us determine
 	// what IP is actually reachable (when there're v4/v6 addresses).
-	rawConn, err := getDialHandler(doq.r, doq.proxyAdapter, doq.proxyName)(ctx, "udp", doq.addr)
+	rawConn, err := doq.dialer.DialContext(ctx, "udp", doq.addr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open a QUIC connection: %w", err)
 	}
@@ -315,7 +321,7 @@ func (doq *dnsOverQUIC) openConnection(ctx context.Context) (conn quic.Connectio
 
 	p, err := strconv.Atoi(port)
 	udpAddr := net.UDPAddr{IP: net.ParseIP(ip), Port: p}
-	udp, err := listenPacket(ctx, doq.proxyAdapter, doq.proxyName, "udp", addr, doq.r)
+	udp, err := doq.dialer.ListenPacket(ctx, "udp", addr)
 	if err != nil {
 		return nil, err
 	}
@@ -328,7 +334,7 @@ func (doq *dnsOverQUIC) openConnection(ctx context.Context) (conn quic.Connectio
 	tlsConfig := ca.GetGlobalTLSConfig(
 		&tls.Config{
 			ServerName:         host,
-			InsecureSkipVerify: false,
+			InsecureSkipVerify: doq.skipCertVerify,
 			NextProtos: []string{
 				NextProtoDQ,
 			},
@@ -338,7 +344,7 @@ func (doq *dnsOverQUIC) openConnection(ctx context.Context) (conn quic.Connectio
 	transport := quic.Transport{Conn: udp}
 	transport.SetCreatedConn(true) // auto close conn
 	transport.SetSingleUse(true)   // auto close transport
-	conn, err = transport.Dial(ctx, &udpAddr, tlsConfig, doq.getQUICConfig())
+	conn, err = transport.Dial(ctx, &udpAddr, tlsC.UConfig(tlsConfig), doq.getQUICConfig())
 	if err != nil {
 		return nil, fmt.Errorf("opening quic connection to %s: %w", doq.addr, err)
 	}
