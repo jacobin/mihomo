@@ -3,19 +3,22 @@ package sing
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/adapter/inbound"
-	"github.com/metacubex/mihomo/adapter/outbound"
 	N "github.com/metacubex/mihomo/common/net"
+	"github.com/metacubex/mihomo/common/utils"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
 
+	"github.com/gofrs/uuid/v5"
 	mux "github.com/metacubex/sing-mux"
 	vmess "github.com/metacubex/sing-vmess"
+	"github.com/metacubex/sing-vmess/packetaddr"
 	"github.com/metacubex/sing/common"
 	"github.com/metacubex/sing/common/buf"
 	"github.com/metacubex/sing/common/bufio"
@@ -49,6 +52,7 @@ type BrutalOptions struct {
 
 type ListenerHandler struct {
 	ListenerConfig
+	handlerId  uuid.UUID
 	muxService *mux.Service
 }
 
@@ -69,6 +73,7 @@ func ConvertMetadata(metadata *C.Metadata) M.Metadata {
 
 func NewListenerHandler(lc ListenerConfig) (h *ListenerHandler, err error) {
 	h = &ListenerHandler{ListenerConfig: lc}
+	h.handlerId = utils.NewUUIDV4()
 	h.muxService, err = mux.NewService(mux.ServiceOptions{
 		NewStreamContext: func(ctx context.Context, conn net.Conn) context.Context {
 			return ctx
@@ -78,8 +83,8 @@ func NewListenerHandler(lc ListenerConfig) (h *ListenerHandler, err error) {
 		Padding: lc.MuxOption.Padding,
 		Brutal: mux.BrutalOptions{
 			Enabled:    lc.MuxOption.Brutal.Enabled,
-			SendBPS:    outbound.StringToBps(lc.MuxOption.Brutal.Up),
-			ReceiveBPS: outbound.StringToBps(lc.MuxOption.Brutal.Down),
+			SendBPS:    utils.StringToBps(lc.MuxOption.Brutal.Up),
+			ReceiveBPS: utils.StringToBps(lc.MuxOption.Brutal.Down),
 		},
 	})
 	return
@@ -102,7 +107,7 @@ func (h *ListenerHandler) ParseSpecialFqdn(ctx context.Context, conn net.Conn, m
 	case mux.Destination.Fqdn:
 		return h.muxService.NewConnection(ctx, conn, UpstreamMetadata(metadata))
 	case vmess.MuxDestination.Fqdn:
-		return vmess.HandleMuxConnection(ctx, conn, h)
+		return vmess.HandleMuxConnection(ctx, conn, metadata, h)
 	case uot.MagicAddress:
 		request, err := uot.ReadRequest(conn)
 		if err != nil {
@@ -145,6 +150,12 @@ func (h *ListenerHandler) NewConnection(ctx context.Context, conn net.Conn, meta
 }
 
 func (h *ListenerHandler) NewPacketConnection(ctx context.Context, conn network.PacketConn, metadata M.Metadata) error {
+	if metadata.Destination.Fqdn == packetaddr.SeqPacketMagicAddress {
+		conn = packetaddr.NewConn(bufio.NewNetPacketConn(conn), M.Socksaddr{})
+	}
+
+	connID := utils.NewUUIDV4().String() // make a new SNAT key
+
 	defer func() { _ = conn.Close() }()
 	mutex := sync.Mutex{}
 	writer := bufio.NewNetPacketWriter(conn) // a new interface to set nil in defer
@@ -187,6 +198,7 @@ func (h *ListenerHandler) NewPacketConnection(ctx context.Context, conn network.
 			lAddr:  conn.LocalAddr(),
 			buff:   buff,
 		}
+		cPacket.rAddr = N.NewCustomAddr(h.Type.String(), connID, cPacket.rAddr) // for tunnel's handleUDPConn
 		if lAddr := getInAddr(ctx); lAddr != nil {
 			cPacket.lAddr = lAddr
 		}
@@ -208,10 +220,12 @@ func (h *ListenerHandler) NewPacket(ctx context.Context, key netip.AddrPort, buf
 		rAddr:  metadata.Source.UDPAddr(),
 		buff:   buffer,
 	}
-	if conn, ok := common.Cast[localAddr](writer); ok {
-		cPacket.rAddr = conn.LocalAddr()
-	} else {
-		cPacket.rAddr = metadata.Source.UDPAddr() // tun does not have real inAddr
+	if h.Type != C.TUN { // make the handler-related SNAT key for not TUN listener
+		connID := fmt.Sprintf("%s:%s", h.handlerId, key)
+		cPacket.rAddr = N.NewCustomAddr(h.Type.String(), connID, cPacket.rAddr) // for tunnel's handleUDPConn
+	}
+	if conn, ok := common.Cast[localAddr](writer); ok { // tun does not have real inAddr
+		cPacket.lAddr = conn.LocalAddr()
 	}
 	h.handlePacket(ctx, cPacket, metadata.Source, metadata.Destination)
 }

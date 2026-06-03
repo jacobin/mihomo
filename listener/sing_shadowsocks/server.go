@@ -14,6 +14,8 @@ import (
 	"github.com/metacubex/mihomo/listener/sing"
 	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/ntp"
+	"github.com/metacubex/mihomo/transport/kcptun"
+	obfs "github.com/metacubex/mihomo/transport/simple-obfs"
 
 	shadowsocks "github.com/metacubex/sing-shadowsocks"
 	"github.com/metacubex/sing-shadowsocks/shadowaead"
@@ -33,6 +35,7 @@ type Listener struct {
 	udpListeners []net.PacketConn
 	service      shadowsocks.Service
 	shadowTLS    *shadowtls.Service
+	simpleObfs   func(net.Conn) net.Conn
 }
 
 var _listener *Listener
@@ -138,6 +141,23 @@ func New(config LC.ShadowsocksServer, tunnel C.Tunnel, additions ...inbound.Addi
 		}
 	}
 
+	if config.SimpleObfs.Enable {
+		switch config.SimpleObfs.Mode {
+		case "http":
+			sl.simpleObfs = obfs.NewHTTPObfsServer
+		case "tls":
+			sl.simpleObfs = obfs.NewTLSObfsServer
+		default:
+			return nil, fmt.Errorf("unsupported simple obfs mode: %s", config.SimpleObfs.Mode)
+		}
+	}
+
+	var kcptunServer *kcptun.Server
+	if config.KcpTun.Enable {
+		kcptunServer = kcptun.NewServer(config.KcpTun.Config)
+		config.Udp = true
+	}
+
 	for _, addr := range strings.Split(config.Listen, ",") {
 		addr := addr
 
@@ -153,6 +173,14 @@ func New(config LC.ShadowsocksServer, tunnel C.Tunnel, additions ...inbound.Addi
 			}
 
 			sl.udpListeners = append(sl.udpListeners, ul)
+
+			if kcptunServer != nil {
+				go kcptunServer.Serve(ul, func(c net.Conn) {
+					sl.HandleConn(c, tunnel)
+				})
+
+				continue // skip tcp listener
+			}
 
 			go func() {
 				conn := bufio.NewPacketConn(ul)
@@ -253,6 +281,9 @@ func (l *Listener) AddrList() (addrList []net.Addr) {
 
 func (l *Listener) HandleConn(conn net.Conn, tunnel C.Tunnel, additions ...inbound.Addition) {
 	ctx := sing.WithAdditions(context.TODO(), additions...)
+	if l.simpleObfs != nil {
+		conn = l.simpleObfs(conn)
+	}
 	err := l.service.NewConnection(ctx, conn, M.Metadata{
 		Protocol: "shadowsocks",
 		Source:   M.SocksaddrFromNet(conn.RemoteAddr()),
